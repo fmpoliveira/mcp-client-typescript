@@ -15,7 +15,6 @@ if (!ANTHROPIC_API_KEY) {
 class MCPClient {
   private mcps: Client[] = [];
   private anthropic: Anthropic;
-  private transports: StdioClientTransport[] = [];
   private tools: Tool[] = [];
   private toolToServerMap: Map<string, number> = new Map();
 
@@ -25,8 +24,8 @@ class MCPClient {
 
   async connectToServer(serverScriptPaths: string[]) {
     try {
-      const connections = serverScriptPaths.map(
-        async (serverScriptPath, index) => {
+      const allTools = await Promise.all(
+        serverScriptPaths.map(async (serverScriptPath, index) => {
           console.log(`Connecting to server ${index + 1}: ${serverScriptPath}`);
 
           const isJs = serverScriptPath.endsWith(".js");
@@ -51,8 +50,6 @@ class MCPClient {
             },
           });
 
-          this.transports.push(transport);
-
           const mcpInstance = new Client({
             name: `mcp-client-${index}`,
             version: "1.0.0",
@@ -70,19 +67,17 @@ class MCPClient {
 
           return toolsResult.tools.map((tool) => {
             this.toolToServerMap.set(tool.name, index);
+
             return {
               name: tool.name,
               description: tool.description,
               input_schema: tool.inputSchema,
             };
           });
-        }
+        })
       );
 
-      const allTools = await Promise.all(connections);
       this.tools = allTools.flat();
-
-      console.log("this.toolToServerMap: ", this.toolToServerMap);
 
       console.log(
         "Connected to server with tools: ",
@@ -116,18 +111,13 @@ class MCPClient {
     try {
       for (const content of response.content) {
         if (content.type === "text") {
-          console.log("Processing text content");
           finalText.push(content.text);
         } else if (content.type === "tool_use") {
-          console.log("Processing tool use");
-
           const toolName = content.name;
-          console.log("toolName: ", toolName);
 
           const toolArgs = content.input as
             | { [x: string]: unknown }
             | undefined;
-          console.log("toolArgs: ", toolArgs);
 
           const serverIndex = this.toolToServerMap.get(toolName);
 
@@ -146,7 +136,6 @@ class MCPClient {
             arguments: toolArgs,
           });
 
-          console.log("Tool call result: ", result);
           toolResults.push(result);
 
           finalText.push(
@@ -220,7 +209,7 @@ class MCPClient {
 async function main() {
   if (process.argv.length < 3) {
     console.log(
-      "Usage: node index.ts <path-to-server-script-1> [<path-to-server-script-2> ...]"
+      "Usage: tsc && node index.ts <path-to-server-script-1> [<path-to-server-script-2> ...]"
     );
     return;
   }
