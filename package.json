@@ -5,7 +5,7 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "build": "tsc",
-    "start": "node build/index.js /Users/foliveira/xgeeks/Training/AI/MCP-Servers/e-redes/build/index.js"
+    "start": "node build/index.js /Users/foliveira/xgeeks/Training/AI/MCP-Servers/e-redes/build/index.js /Users/foliveira/xgeeks/Training/AI/MCP-Servers/meteostat/build/index.js"
   },
   "keywords": [],
   "author": "",

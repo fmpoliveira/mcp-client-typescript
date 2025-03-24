@@ -13,47 +13,76 @@ if (!ANTHROPIC_API_KEY) {
 }
 
 class MCPClient {
-  private mcp: Client;
+  private mcps: Client[] = [];
   private anthropic: Anthropic;
-  private transport: StdioClientTransport | null = null;
+  private transports: StdioClientTransport[] = [];
   private tools: Tool[] = [];
+  private toolToServerMap: Map<string, number> = new Map();
 
   constructor() {
     this.anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
-    this.mcp = new Client({ name: "mcp-client-cli", version: "1.0.0" });
   }
 
-  async connectToServer(serverScriptPath: string) {
+  async connectToServer(serverScriptPaths: string[]) {
     try {
-      const isJs = serverScriptPath.endsWith(".js");
-      const isPy = serverScriptPath.endsWith(".py");
+      const connections = serverScriptPaths.map(
+        async (serverScriptPath, index) => {
+          console.log(`Connecting to server ${index + 1}: ${serverScriptPath}`);
 
-      if (!isJs && !isPy) {
-        throw new Error("Server script must be a .js or .py file");
-      }
+          const isJs = serverScriptPath.endsWith(".js");
+          const isPy = serverScriptPath.endsWith(".py");
 
-      const command = isPy
-        ? process.platform === "win32"
-          ? "python"
-          : "python3"
-        : process.execPath;
+          if (!isJs && !isPy) {
+            throw new Error("Server script must be a .js or .py file");
+          }
 
-      this.transport = new StdioClientTransport({
-        command,
-        args: [serverScriptPath],
-      });
+          const command = isPy
+            ? process.platform === "win32"
+              ? "python"
+              : "python3"
+            : process.execPath;
 
-      this.mcp.connect(this.transport);
+          const transport = new StdioClientTransport({
+            command,
+            args: [serverScriptPath],
+            env: {
+              METEOSTAT_RAPID_API_KEY:
+                process.env.METEOSTAT_RAPID_API_KEY || "",
+            },
+          });
 
-      const toolsResult = await this.mcp.listTools();
+          this.transports.push(transport);
 
-      this.tools = toolsResult.tools.map((tool) => {
-        return {
-          name: tool.name,
-          description: tool.description,
-          input_schema: tool.inputSchema,
-        };
-      });
+          const mcpInstance = new Client({
+            name: `mcp-client-${index}`,
+            version: "1.0.0",
+          });
+
+          mcpInstance.connect(transport);
+          this.mcps.push(mcpInstance);
+
+          const toolsResult = await mcpInstance.listTools();
+
+          console.log(
+            `Server ${index + 1} tools:`,
+            toolsResult.tools.map((t) => t.name).join(", ")
+          );
+
+          return toolsResult.tools.map((tool) => {
+            this.toolToServerMap.set(tool.name, index);
+            return {
+              name: tool.name,
+              description: tool.description,
+              input_schema: tool.inputSchema,
+            };
+          });
+        }
+      );
+
+      const allTools = await Promise.all(connections);
+      this.tools = allTools.flat();
+
+      console.log("this.toolToServerMap: ", this.toolToServerMap);
 
       console.log(
         "Connected to server with tools: ",
@@ -80,41 +109,72 @@ class MCPClient {
       tools: this.tools,
     });
 
+    console.log("Claude response received: ");
     const finalText = [];
     const toolResults = [];
 
-    for (const content of response.content) {
-      if (content.type === "text") {
-        finalText.push(content.text);
-      } else if (content.type === "tool_use") {
-        const toolName = content.name;
-        const toolArgs = content.input as { [x: string]: unknown } | undefined;
+    try {
+      for (const content of response.content) {
+        if (content.type === "text") {
+          console.log("Processing text content");
+          finalText.push(content.text);
+        } else if (content.type === "tool_use") {
+          console.log("Processing tool use");
 
-        const result = await this.mcp.callTool({
-          name: toolName,
-          arguments: toolArgs,
-        });
+          const toolName = content.name;
+          console.log("toolName: ", toolName);
 
-        toolResults.push(result);
-        finalText.push(
-          `[Calling tool ${toolName} with args ${JSON.stringify(toolArgs)}]`
-        );
+          const toolArgs = content.input as
+            | { [x: string]: unknown }
+            | undefined;
+          console.log("toolArgs: ", toolArgs);
 
-        messages.push({
-          role: "user",
-          content: result.content as string,
-        });
+          const serverIndex = this.toolToServerMap.get(toolName);
 
-        const response = await this.anthropic.messages.create({
-          model: "claude-3-5-sonnet-20241022",
-          max_tokens: 1000,
-          messages,
-        });
+          if (serverIndex === undefined) {
+            console.error(`Tool ${toolName} not found in any connected server`);
+            finalText.push(
+              `[Error: Tool ${toolName} not found in any connected server]`
+            );
+            continue;
+          }
 
-        finalText.push(
-          response.content[0].type === "text" ? response.content[0].text : ""
-        );
+          console.log(`Calling tool ${toolName} on server ${serverIndex}`);
+
+          const result = await this.mcps[serverIndex].callTool({
+            name: toolName,
+            arguments: toolArgs,
+          });
+
+          console.log("Tool call result: ", result);
+          toolResults.push(result);
+
+          finalText.push(
+            `[Called tool ${toolName} with args ${JSON.stringify(toolArgs)}]`
+          );
+
+          messages.push({
+            role: "user",
+            content: result.content as string,
+          });
+
+          const followUpResponse = await this.anthropic.messages.create({
+            model: "claude-3-5-sonnet-20241022",
+            max_tokens: 1000,
+            messages,
+          });
+
+          const followUpText =
+            followUpResponse.content[0].type === "text"
+              ? followUpResponse.content[0].text
+              : "";
+
+          finalText.push(followUpText);
+        }
       }
+    } catch (error) {
+      console.error("Error on processQuery: ", error);
+      finalText.push(`[Error processing query: ${error}]`);
     }
 
     return finalText.join("\n");
@@ -128,10 +188,13 @@ class MCPClient {
 
     try {
       console.log("\nMCP Client Started!");
+      console.log(`Connected to ${this.mcps.length} MCP servers`);
       console.log("Type your queries or 'quit' to exit.");
 
       while (true) {
-        const message = await rl.question("\nQuery: ");
+        console.log("\x1b[36mQuery\x1b[0m");
+        const message = await rl.question("\n------ ");
+
         if (message.toLowerCase() === "quit") {
           break;
         }
@@ -147,19 +210,25 @@ class MCPClient {
   }
 
   async cleanup() {
-    await this.mcp.close();
+    for (const mcp of this.mcps) {
+      await mcp.close();
+    }
+    console.log("Closed all MCP connections");
   }
 }
 
 async function main() {
   if (process.argv.length < 3) {
-    console.log("Usage: node index.ts <path-to-server-script>");
+    console.log(
+      "Usage: node index.ts <path-to-server-script-1> [<path-to-server-script-2> ...]"
+    );
     return;
   }
   const mcpClient = new MCPClient();
+  const serverScripts = process.argv.slice(2);
 
   try {
-    await mcpClient.connectToServer(process.argv[2]);
+    await mcpClient.connectToServer(serverScripts);
     await mcpClient.chatLoop();
   } catch (error) {
     throw new Error("Failed to start MCP client: " + error);
